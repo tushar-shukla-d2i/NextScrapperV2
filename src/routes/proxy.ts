@@ -80,4 +80,29 @@ router.post('/interact', async (req, res) => {
   }
 });
 
+// POST /api/proxy/execute-js — run JavaScript in the live Playwright session
+router.post('/execute-js', async (req, res) => {
+  const { sessionId, code } = req.body;
+
+  if (!sessionId || !code) {
+    return res.status(400).json({ error: 'sessionId and code are required.' });
+  }
+
+  const session = sessionManager.getSession(sessionId);
+  if (!session) {
+    return res.status(404).json({ error: 'Session not found or expired.' });
+  }
+
+  try {
+    // Wrap in an async IIFE so "return" works at top level in user code
+    const wrappedCode = `(async () => { ${code} })()`;
+    const result = await session.page.evaluate(wrappedCode);
+    return res.json({ result: result !== undefined ? result : null, ok: true });
+  } catch (err: any) {
+    console.error('[execute-js] error:', err.message);
+    return res.status(200).json({ error: err.message, ok: false });
+  }
+});
+
 export default router;
+

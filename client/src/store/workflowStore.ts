@@ -45,7 +45,7 @@ interface WorkflowState {
 
 export const useWorkflowStore = create<WorkflowState>((set) => ({
   steps: [],
-  targetUrl: 'https://example.com',
+  targetUrl: '',
   extractionTemplate: [],
   scrapedData: [],
   

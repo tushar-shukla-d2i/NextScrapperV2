@@ -5,8 +5,8 @@ import { useWorkflowStore } from '../store/workflowStore';
 import { io } from 'socket.io-client';
 import {
   Share2, Trash2, Play, ServerCrash, Loader2, MousePointerClick,
-  Type, ScanSearch, Code, RepeatIcon, Clock, Tag, Plus, Download, 
-  Table, ChevronDown, ChevronRight
+  Type, ScanSearch, Code, RepeatIcon, Clock, Tag, Plus, Download,
+  Table, ChevronDown, ChevronRight, PlayCircle, CheckCircle2, XCircle
 } from 'lucide-react';
 
 const API = 'http://localhost:3001';
@@ -29,6 +29,8 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<'steps' | 'template' | 'data'>('steps');
   const [showAddStepMenu, setShowAddStepMenu] = useState(false);
   const [expandedIterateSteps, setExpandedIterateSteps] = useState<Set<string>>(new Set());
+  // JS step test runner state: stepId → { running, result, error }
+  const [jsTestResults, setJsTestResults] = useState<Record<string, { running: boolean; result?: string; error?: string }>>({});
 
   // Refs so the single-mount event handler always has fresh values
   const sessionIdRef = useRef<string | null>(null);
@@ -152,15 +154,42 @@ export default function Home() {
     }
   };
 
+  // ── Run JS step in live session ───────────────────────────────────────────
+  const runJsInSession = async (stepId: string, code: string) => {
+    if (!sessionId) {
+      setJsTestResults(prev => ({ ...prev, [stepId]: { running: false, error: 'No active session — click Preview Proxy first.' } }));
+      return;
+    }
+    setJsTestResults(prev => ({ ...prev, [stepId]: { running: true } }));
+    try {
+      const res = await fetch(`${API}/api/proxy/execute-js`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ sessionId, code })
+      });
+      const data = await res.json();
+      if (data.error) {
+        setJsTestResults(prev => ({ ...prev, [stepId]: { running: false, error: data.error } }));
+      } else {
+        const resultStr = data.result !== null && data.result !== undefined
+          ? JSON.stringify(data.result, null, 2)
+          : '(null)';
+        setJsTestResults(prev => ({ ...prev, [stepId]: { running: false, result: resultStr } }));
+      }
+    } catch (e: any) {
+      setJsTestResults(prev => ({ ...prev, [stepId]: { running: false, error: e.message } }));
+    }
+  };
+
   // ── Run workflow ──────────────────────────────────────────────────────────
   const runWorkflow = async () => {
     setRunLogs(['🚀 Dispatching workflow to Queue…']);
     setActiveTab('data');
     clearScrapedData();
-    
+
     // Update preview to show target URL
     setCurrentUrl(targetUrl);
-    
+
     try {
       const createRes = await fetch(`${API}/api/workflows`, {
         method: 'POST',
@@ -173,20 +202,27 @@ export default function Home() {
       const workflow = await createRes.json();
       const runRes = await fetch(`${API}/api/workflows/run/${workflow.id}`, { method: 'POST' });
       const { jobId } = await runRes.json();
-      
+
       if (socket) {
+        // Remove old listeners to avoid duplicates on re-runs
+        socket.off('log');
+        socket.off('scraped_data');
+
         socket.emit('join_job', jobId);
+
         socket.on('log', (logInfo: any) => {
           setRunLogs(prev => [
             ...prev,
             `[${new Date(logInfo.timestamp).toLocaleTimeString()}] ${logInfo.message}`
           ]);
         });
-        
-        // Listen for scraped data
+
         socket.on('scraped_data', (data: any) => {
-          setScrapedData(data.results || []);
-          setRunLogs(prev => [...prev, `✅ Extracted ${data.results?.length || 0} records`]);
+          const results = data.results || [];
+          setScrapedData(results);
+          setRunLogs(prev => [...prev, `✅ Extracted ${results.length} record${results.length !== 1 ? 's' : ''}`]);
+          // Auto-switch to data tab once results arrive
+          setActiveTab('data');
         });
       }
     } catch {
@@ -471,16 +507,46 @@ export default function Home() {
                         </div>
                       )}
 
-                      {/* JavaScript code editor */}
+                      {/* JavaScript code editor + Test button */}
                       {step.action === 'javascript' && (
-                        <textarea
-                          value={step.jsCode || ''}
-                          onChange={(e) => updateStep(step.id, { jsCode: e.target.value })}
-                          placeholder="// Your JavaScript code here"
-                          className="w-full mt-1.5 bg-neutral-950 border border-neutral-700 text-[10px] rounded
-                            px-2 py-1.5 text-neutral-300 focus:outline-none focus:border-yellow-500 placeholder-neutral-600 font-mono resize-none"
-                          rows={4}
-                        />
+                        <div className="mt-1.5 space-y-1.5">
+                          <textarea
+                            value={step.jsCode || ''}
+                            onChange={(e) => updateStep(step.id, { jsCode: e.target.value })}
+                            placeholder="// Your JavaScript code here"
+                            className="w-full bg-neutral-950 border border-neutral-700 text-[10px] rounded
+                              px-2 py-1.5 text-neutral-300 focus:outline-none focus:border-yellow-500 placeholder-neutral-600 font-mono resize-none"
+                            rows={4}
+                          />
+                          {/* Test runner button */}
+                          <button
+                            onClick={() => runJsInSession(step.id, step.jsCode || '')}
+                            disabled={!step.jsCode || jsTestResults[step.id]?.running}
+                            className="flex items-center gap-1.5 px-2.5 py-1 bg-yellow-500/10 hover:bg-yellow-500/20
+                              border border-yellow-500/30 text-yellow-400 text-[10px] font-semibold rounded
+                              transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                          >
+                            {jsTestResults[step.id]?.running
+                              ? <Loader2 className="w-3 h-3 animate-spin" />
+                              : <PlayCircle className="w-3 h-3" />
+                            }
+                            {jsTestResults[step.id]?.running ? 'Running…' : 'Test in Session'}
+                          </button>
+                          {/* Result / error display */}
+                          {jsTestResults[step.id] && !jsTestResults[step.id]?.running && (
+                            <div className={`rounded border px-2 py-1.5 font-mono text-[10px] whitespace-pre-wrap break-all max-h-24 overflow-y-auto
+                              ${
+                                jsTestResults[step.id]?.error
+                                  ? 'bg-red-950/40 border-red-500/30 text-red-400'
+                                  : 'bg-emerald-950/40 border-emerald-500/30 text-emerald-300'
+                              }`}
+                            >
+                              {jsTestResults[step.id]?.error
+                                ? <><XCircle className="w-3 h-3 inline mr-1" />{jsTestResults[step.id]?.error}</>
+                                : <><CheckCircle2 className="w-3 h-3 inline mr-1" />{jsTestResults[step.id]?.result}</>}
+                            </div>
+                          )}
+                        </div>
                       )}
 
                       {/* Wait duration */}
