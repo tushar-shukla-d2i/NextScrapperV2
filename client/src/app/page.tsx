@@ -4,34 +4,42 @@ import { useState, useEffect, useRef } from 'react';
 import { useWorkflowStore } from '../store/workflowStore';
 import { io } from 'socket.io-client';
 import {
-  Share2, Trash2, Play, ServerCrash,
-  Loader2, MousePointerClick, Type, ScanSearch
+  Share2, Trash2, Play, ServerCrash, Loader2, MousePointerClick,
+  Type, ScanSearch, Code, RepeatIcon, Clock, Tag, Plus, Download, 
+  Table, ChevronDown, ChevronRight
 } from 'lucide-react';
 
 const API = 'http://localhost:3001';
 
 export default function Home() {
-  const { steps, targetUrl, setTargetUrl, addStep, removeStep, updateStep, clearSteps } =
-    useWorkflowStore();
+  const {
+    steps, targetUrl, extractionTemplate, scrapedData,
+    setTargetUrl, addStep, removeStep, updateStep, clearSteps,
+    addExtractionField, updateExtractionField, removeExtractionField, clearExtractionTemplate,
+    setScrapedData, clearScrapedData
+  } = useWorkflowStore();
 
-  const [proxyHtml, setProxyHtml]         = useState<string>('');
-  const [sessionId, setSessionId]         = useState<string | null>(null);
-  const [navigating, setNavigating]       = useState(false);
+  const [proxyHtml, setProxyHtml] = useState<string>('');
+  const [sessionId, setSessionId] = useState<string | null>(null);
+  const [navigating, setNavigating] = useState(false);
   const [loadingSession, setLoadingSession] = useState(false);
-  const [runLogs, setRunLogs]             = useState<string[]>([]);
-  const [socket, setSocket]               = useState<any>(null);
-  const [currentUrl, setCurrentUrl]       = useState('');
+  const [runLogs, setRunLogs] = useState<string[]>([]);
+  const [socket, setSocket] = useState<any>(null);
+  const [currentUrl, setCurrentUrl] = useState('');
+  const [activeTab, setActiveTab] = useState<'steps' | 'template' | 'data'>('steps');
+  const [showAddStepMenu, setShowAddStepMenu] = useState(false);
+  const [expandedIterateSteps, setExpandedIterateSteps] = useState<Set<string>>(new Set());
 
   // Refs so the single-mount event handler always has fresh values
-  const sessionIdRef  = useRef<string | null>(null);
-  const addStepRef    = useRef(addStep);
-  const setTargetRef  = useRef(setTargetUrl);
+  const sessionIdRef = useRef<string | null>(null);
+  const addStepRef = useRef(addStep);
+  const setTargetRef = useRef(setTargetUrl);
   const inputDebounce = useRef<NodeJS.Timeout | null>(null);
 
   // Keep refs in sync with latest values
-  useEffect(() => { sessionIdRef.current  = sessionId;   }, [sessionId]);
-  useEffect(() => { addStepRef.current    = addStep;     }, [addStep]);
-  useEffect(() => { setTargetRef.current  = setTargetUrl;}, [setTargetUrl]);
+  useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
+  useEffect(() => { addStepRef.current = addStep; }, [addStep]);
+  useEffect(() => { setTargetRef.current = setTargetUrl; }, [setTargetUrl]);
 
   // Socket
   useEffect(() => {
@@ -46,9 +54,9 @@ export default function Home() {
       const data = event.data;
       if (!data || !data.type) return;
 
-      const sid     = sessionIdRef.current;
-      const doAdd   = addStepRef.current;
-      const doNavUrl= setTargetRef.current;
+      const sid = sessionIdRef.current;
+      const doAdd = addStepRef.current;
+      const doNavUrl = setTargetRef.current;
 
       // ────── Input / typing ──────────────────────────────────────────────
       if (data.type === 'USER_INPUT_CHANGE') {
@@ -111,8 +119,8 @@ export default function Home() {
 
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  // mount once — all mutable values accessed through refs
-  // eslint-disable-next-line react-hooks/exhaustive-deps
+    // mount once — all mutable values accessed through refs
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // ── Load proxy session ────────────────────────────────────────────────────
@@ -123,7 +131,7 @@ export default function Home() {
     setProxyHtml('');
     setSessionId(null);
     try {
-      const res  = await fetch(`${API}/api/proxy/session`, {
+      const res = await fetch(`${API}/api/proxy/session`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: targetUrl })
@@ -146,16 +154,26 @@ export default function Home() {
 
   // ── Run workflow ──────────────────────────────────────────────────────────
   const runWorkflow = async () => {
-    setRunLogs(['Dispatching workflow to Queue…']);
+    setRunLogs(['🚀 Dispatching workflow to Queue…']);
+    setActiveTab('data');
+    clearScrapedData();
+    
+    // Update preview to show target URL
+    setCurrentUrl(targetUrl);
+    
     try {
       const createRes = await fetch(`${API}/api/workflows`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: 'Visual Flow', config: { steps, url: targetUrl } })
+        body: JSON.stringify({
+          name: 'Visual Flow',
+          config: { steps, url: targetUrl, extractionTemplate }
+        })
       });
       const workflow = await createRes.json();
-      const runRes   = await fetch(`${API}/api/workflows/run/${workflow.id}`, { method: 'POST' });
+      const runRes = await fetch(`${API}/api/workflows/run/${workflow.id}`, { method: 'POST' });
       const { jobId } = await runRes.json();
+      
       if (socket) {
         socket.emit('join_job', jobId);
         socket.on('log', (logInfo: any) => {
@@ -164,39 +182,98 @@ export default function Home() {
             `[${new Date(logInfo.timestamp).toLocaleTimeString()}] ${logInfo.message}`
           ]);
         });
+        
+        // Listen for scraped data
+        socket.on('scraped_data', (data: any) => {
+          setScrapedData(data.results || []);
+          setRunLogs(prev => [...prev, `✅ Extracted ${data.results?.length || 0} records`]);
+        });
       }
     } catch {
-      setRunLogs(prev => [...prev, 'Failed to execute workflow.']);
+      setRunLogs(prev => [...prev, '❌ Failed to execute workflow.']);
     }
+  };
+
+  // ── Manual step additions ────────────────────────────────────────────────
+  const manualAddStep = (stepType: 'iterate' | 'javascript' | 'wait') => {
+    if (stepType === 'iterate') {
+      addStep({
+        action: 'iterate',
+        selector: '',
+        itemSelector: '.card, .item, [data-item]',
+        iterateSteps: []
+      });
+    } else if (stepType === 'javascript') {
+      addStep({
+        action: 'javascript',
+        jsCode: '// Execute custom JavaScript\n// Return value will be used in workflow\nreturn document.querySelectorAll(\'.item\').length;'
+      });
+    } else if (stepType === 'wait') {
+      addStep({
+        action: 'wait',
+        waitMs: 1000
+      });
+    }
+    setShowAddStepMenu(false);
   };
 
   // ── Helpers ───────────────────────────────────────────────────────────────
   const actionBadge = (action: string) => {
-    const map: Record<string, { label: string; cls: string }> = {
-      click:   { label: 'CLICK',   cls: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40' },
-      fill:    { label: 'FILL',    cls: 'bg-blue-500/20 text-blue-400 border-blue-500/40' },
-      extract: { label: 'EXTRACT', cls: 'bg-amber-500/20 text-amber-400 border-amber-500/40' },
+    const map: Record<string, { label: string; cls: string; icon: any }> = {
+      click: { label: 'CLICK', cls: 'bg-emerald-500/20 text-emerald-400 border-emerald-500/40', icon: MousePointerClick },
+      fill: { label: 'FILL', cls: 'bg-blue-500/20 text-blue-400 border-blue-500/40', icon: Type },
+      extract: { label: 'EXTRACT', cls: 'bg-amber-500/20 text-amber-400 border-amber-500/40', icon: ScanSearch },
+      iterate: { label: 'LOOP', cls: 'bg-purple-500/20 text-purple-400 border-purple-500/40', icon: RepeatIcon },
+      javascript: { label: 'JS', cls: 'bg-yellow-500/20 text-yellow-400 border-yellow-500/40', icon: Code },
+      wait: { label: 'WAIT', cls: 'bg-cyan-500/20 text-cyan-400 border-cyan-500/40', icon: Clock },
     };
-    const b = map[action] ?? { label: action.toUpperCase(), cls: 'bg-neutral-700 text-neutral-400 border-neutral-600' };
+    const b = map[action] ?? { label: action.toUpperCase(), cls: 'bg-neutral-700 text-neutral-400 border-neutral-600', icon: null };
+    const Icon = b.icon;
     return (
-      <span className={`px-1.5 py-0.5 text-[9px] font-bold border rounded tracking-widest ${b.cls}`}>
+      <span className={`px-1.5 py-0.5 text-[9px] font-bold border rounded tracking-widest flex items-center gap-1 ${b.cls}`}>
+        {Icon && <Icon className="w-2.5 h-2.5" />}
         {b.label}
       </span>
     );
   };
 
   const sidebarAccentClass = (action: string) => {
-    if (action === 'click')   return 'before:bg-emerald-500';
-    if (action === 'fill')    return 'before:bg-blue-500';
+    if (action === 'click') return 'before:bg-emerald-500';
+    if (action === 'fill') return 'before:bg-blue-500';
     if (action === 'extract') return 'before:bg-amber-500';
+    if (action === 'iterate') return 'before:bg-purple-500';
+    if (action === 'javascript') return 'before:bg-yellow-500';
+    if (action === 'wait') return 'before:bg-cyan-500';
     return 'before:bg-neutral-500';
+  };
+
+  const toggleIterateExpand = (id: string) => {
+    setExpandedIterateSteps(prev => {
+      const next = new Set(prev);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
+      }
+      return next;
+    });
+  };
+
+  const exportData = () => {
+    const json = JSON.stringify(scrapedData, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `scraped-data-${Date.now()}.json`;
+    a.click();
   };
 
   return (
     <main className="flex h-screen bg-neutral-950 text-neutral-100 overflow-hidden font-sans">
 
       {/* ── Sidebar ─────────────────────────────────────────────────────── */}
-      <aside className="w-[300px] border-r border-neutral-800 bg-neutral-900 flex flex-col z-20">
+      <aside className="w-[340px] border-r border-neutral-800 bg-neutral-900 flex flex-col z-20">
         {/* Header */}
         <div className="px-4 py-3 border-b border-neutral-800 flex items-center gap-2">
           <Share2 className="text-emerald-400 w-4 h-4" />
@@ -211,89 +288,361 @@ export default function Home() {
           )}
         </div>
 
-        {/* Steps list */}
-        <div className="flex-1 overflow-y-auto px-3 py-3 space-y-2">
-          <div className="flex items-center justify-between mb-1">
-            <span className="text-[10px] uppercase text-neutral-500 font-bold tracking-widest">
-              Steps ({steps.length})
-            </span>
-            {steps.length > 0 && (
-              <button
-                onClick={clearSteps}
-                className="text-[10px] text-neutral-600 hover:text-red-400 transition-colors"
-              >
-                Clear all
-              </button>
-            )}
-          </div>
+        {/* Tabs */}
+        <div className="flex border-b border-neutral-800 bg-neutral-900">
+          <button
+            onClick={() => setActiveTab('steps')}
+            className={`flex-1 px-3 py-2 text-[11px] font-bold transition-colors ${activeTab === 'steps'
+              ? 'text-emerald-400 border-b-2 border-emerald-400'
+              : 'text-neutral-500 hover:text-neutral-300'
+              }`}
+          >
+            STEPS ({steps.length})
+          </button>
+          <button
+            onClick={() => setActiveTab('template')}
+            className={`flex-1 px-3 py-2 text-[11px] font-bold transition-colors ${activeTab === 'template'
+              ? 'text-amber-400 border-b-2 border-amber-400'
+              : 'text-neutral-500 hover:text-neutral-300'
+              }`}
+          >
+            <Tag className="w-3 h-3 inline mr-1" />
+            TEMPLATE ({extractionTemplate.length})
+          </button>
+          <button
+            onClick={() => setActiveTab('data')}
+            className={`flex-1 px-3 py-2 text-[11px] font-bold transition-colors ${activeTab === 'data'
+              ? 'text-blue-400 border-b-2 border-blue-400'
+              : 'text-neutral-500 hover:text-neutral-300'
+              }`}
+          >
+            <Table className="w-3 h-3 inline mr-1" />
+            DATA ({scrapedData.length})
+          </button>
+        </div>
 
-          {steps.length === 0 ? (
-            <div className="mt-6 text-center border border-dashed border-neutral-800 rounded-xl p-6">
-              <div className="text-3xl mb-2">👆</div>
-              <p className="text-xs text-neutral-500">
-                Load a URL then click elements in the preview to build your workflow.
-              </p>
-            </div>
-          ) : (
-            steps.map((step, idx) => (
-              <div
-                key={step.id}
-                className={`relative group px-3 py-2.5 bg-neutral-800 border border-neutral-700/60 rounded-lg
-                  before:content-[''] before:absolute before:left-0 before:top-2 before:bottom-2
-                  before:w-[3px] before:rounded-full before:ml-[-1px] ${sidebarAccentClass(step.action)}`}
-              >
-                <div className="flex items-center justify-between gap-2">
-                  <div className="flex items-center gap-2 min-w-0 flex-1">
-                    <span className="text-[10px] text-neutral-600 shrink-0 font-mono">
-                      {String(idx + 1).padStart(2, '0')}
-                    </span>
-                    {actionBadge(step.action)}
-                    <select
-                      value={step.action}
-                      onChange={(e) => updateStep(step.id, { action: e.target.value as any })}
-                      className="bg-neutral-900 text-neutral-300 border border-neutral-700 rounded px-1.5 py-0.5
-                        text-[11px] focus:outline-none focus:ring-1 focus:ring-emerald-500 cursor-pointer"
+        {/* Content area */}
+        <div className="flex-1 overflow-y-auto px-3 py-3">
+          {/* ─── STEPS TAB ─────────────────────────────────────────────── */}
+          {activeTab === 'steps' && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between mb-1">
+                <span className="text-[10px] uppercase text-neutral-500 font-bold tracking-widest">
+                  Workflow Steps
+                </span>
+                <div className="flex gap-1">
+                  {steps.length > 0 && (
+                    <button
+                      onClick={clearSteps}
+                      className="text-[10px] text-neutral-600 hover:text-red-400 transition-colors"
                     >
-                      <option value="click">Click</option>
-                      <option value="fill">Fill</option>
-                      <option value="extract">Extract</option>
+                      Clear all
+                    </button>
+                  )}
+                  <div className="relative">
+                    <button
+                      onClick={() => setShowAddStepMenu(!showAddStepMenu)}
+                      className="flex items-center gap-1 px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-[10px] text-emerald-400 rounded border border-neutral-700 transition-colors"
+                    >
+                      <Plus className="w-3 h-3" />
+                      Add
+                    </button>
+                    {showAddStepMenu && (
+                      <div className="absolute right-0 top-full mt-1 bg-neutral-800 border border-neutral-700 rounded-lg shadow-xl z-50 min-w-[160px]">
+                        <button
+                          onClick={() => manualAddStep('iterate')}
+                          className="w-full flex items-center gap-2 px-3 py-2 text-[11px] hover:bg-neutral-700 text-left transition-colors"
+                        >
+                          <RepeatIcon className="w-3.5 h-3.5 text-purple-400" />
+                          <span>Loop / Iterate</span>
+                        </button>
+                        <button
+                          onClick={() => manualAddStep('javascript')}
+                          className="w-full flex items-center gap-2 px-3 py-2 text-[11px] hover:bg-neutral-700 text-left transition-colors"
+                        >
+                          <Code className="w-3.5 h-3.5 text-yellow-400" />
+                          <span>JavaScript</span>
+                        </button>
+                        <button
+                          onClick={() => manualAddStep('wait')}
+                          className="w-full flex items-center gap-2 px-3 py-2 text-[11px] hover:bg-neutral-700 text-left transition-colors"
+                        >
+                          <Clock className="w-3.5 h-3.5 text-cyan-400" />
+                          <span>Wait / Delay</span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {steps.length === 0 ? (
+                <div className="mt-6 text-center border border-dashed border-neutral-800 rounded-xl p-6">
+                  <div className="text-3xl mb-2">👆</div>
+                  <p className="text-xs text-neutral-500">
+                    Load a URL then click elements in the preview to build your workflow.
+                  </p>
+                  <p className="text-xs text-neutral-600 mt-2">
+                    Or use the <span className="text-emerald-400">+ Add</span> button for advanced steps.
+                  </p>
+                </div>
+              ) : (
+                steps.map((step, idx) => (
+                  <div key={step.id} className="space-y-1">
+                    <div
+                      className={`relative group px-3 py-2.5 bg-neutral-800 border border-neutral-700/60 rounded-lg
+                        before:content-[''] before:absolute before:left-0 before:top-2 before:bottom-2
+                        before:w-[3px] before:rounded-full before:ml-[-1px] ${sidebarAccentClass(step.action)}`}
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2 min-w-0 flex-1">
+                          <span className="text-[10px] text-neutral-600 shrink-0 font-mono">
+                            {String(idx + 1).padStart(2, '0')}
+                          </span>
+                          {actionBadge(step.action)}
+                          {step.action === 'iterate' && (
+                            <button
+                              onClick={() => toggleIterateExpand(step.id)}
+                              className="text-neutral-500 hover:text-neutral-300"
+                            >
+                              {expandedIterateSteps.has(step.id) ? (
+                                <ChevronDown className="w-3.5 h-3.5" />
+                              ) : (
+                                <ChevronRight className="w-3.5 h-3.5" />
+                              )}
+                            </button>
+                          )}
+                        </div>
+                        <button
+                          onClick={() => removeStep(step.id)}
+                          className="text-neutral-600 hover:text-red-400 transition-colors shrink-0"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+
+                      {/* Selector for click/fill/extract */}
+                      {(step.action === 'click' || step.action === 'fill' || step.action === 'extract') && (
+                        <div className="mt-1.5 text-[10px] text-neutral-500 font-mono truncate bg-neutral-950/60
+                          px-2 py-0.5 rounded border border-neutral-800">
+                          {step.selector || '—'}
+                        </div>
+                      )}
+
+                      {/* Fill value input */}
+                      {step.action === 'fill' && (
+                        <input
+                          type="text"
+                          placeholder="Value to fill…"
+                          value={step.value || ''}
+                          onChange={(e) => updateStep(step.id, { value: e.target.value })}
+                          className="w-full mt-1.5 bg-neutral-950 border border-neutral-700 text-[11px] rounded
+                            px-2 py-1 text-neutral-300 focus:outline-none focus:border-blue-500 placeholder-neutral-600"
+                        />
+                      )}
+
+                      {/* Extracted text preview */}
+                      {step.action === 'extract' && step.text && (
+                        <div className="mt-1.5 text-[10px] text-neutral-500 italic truncate
+                          border-l-2 border-amber-500/30 pl-1.5">
+                          "{step.text}"
+                        </div>
+                      )}
+
+                      {/* Iterate controls */}
+                      {step.action === 'iterate' && (
+                        <div className="mt-2 space-y-1.5">
+                          <input
+                            type="text"
+                            placeholder="Container selector (e.g., .cards)"
+                            value={step.selector || ''}
+                            onChange={(e) => updateStep(step.id, { selector: e.target.value })}
+                            className="w-full bg-neutral-950 border border-neutral-700 text-[10px] rounded
+                              px-2 py-1 text-neutral-300 focus:outline-none focus:border-purple-500 placeholder-neutral-600 font-mono"
+                          />
+                          <input
+                            type="text"
+                            placeholder="Item selector (e.g., .card)"
+                            value={step.itemSelector || ''}
+                            onChange={(e) => updateStep(step.id, { itemSelector: e.target.value })}
+                            className="w-full bg-neutral-950 border border-neutral-700 text-[10px] rounded
+                              px-2 py-1 text-neutral-300 focus:outline-none focus:border-purple-500 placeholder-neutral-600 font-mono"
+                          />
+                        </div>
+                      )}
+
+                      {/* JavaScript code editor */}
+                      {step.action === 'javascript' && (
+                        <textarea
+                          value={step.jsCode || ''}
+                          onChange={(e) => updateStep(step.id, { jsCode: e.target.value })}
+                          placeholder="// Your JavaScript code here"
+                          className="w-full mt-1.5 bg-neutral-950 border border-neutral-700 text-[10px] rounded
+                            px-2 py-1.5 text-neutral-300 focus:outline-none focus:border-yellow-500 placeholder-neutral-600 font-mono resize-none"
+                          rows={4}
+                        />
+                      )}
+
+                      {/* Wait duration */}
+                      {step.action === 'wait' && (
+                        <input
+                          type="number"
+                          placeholder="Milliseconds"
+                          value={step.waitMs || 1000}
+                          onChange={(e) => updateStep(step.id, { waitMs: parseInt(e.target.value) || 1000 })}
+                          className="w-full mt-1.5 bg-neutral-950 border border-neutral-700 text-[11px] rounded
+                            px-2 py-1 text-neutral-300 focus:outline-none focus:border-cyan-500 placeholder-neutral-600"
+                        />
+                      )}
+                    </div>
+
+                    {/* Nested iterate steps */}
+                    {step.action === 'iterate' && expandedIterateSteps.has(step.id) && (
+                      <div className="ml-6 pl-3 border-l-2 border-purple-500/30 space-y-1">
+                        <div className="text-[9px] text-neutral-600 uppercase tracking-wider mb-1">
+                          Steps to repeat for each item:
+                        </div>
+                        <div className="text-[10px] text-neutral-500 bg-neutral-900 rounded px-2 py-1.5 border border-neutral-800">
+                          Add steps by clicking elements in preview while this loop is expanded
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                ))
+              )}
+            </div>
+          )}
+
+          {/* ─── TEMPLATE TAB ──────────────────────────────────────────── */}
+          {activeTab === 'template' && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] uppercase text-neutral-500 font-bold tracking-widest">
+                  Extraction Fields
+                </span>
+                <button
+                  onClick={() => addExtractionField({ label: '', selector: '', attribute: 'textContent' })}
+                  className="flex items-center gap-1 px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-[10px] text-amber-400 rounded border border-neutral-700 transition-colors"
+                >
+                  <Plus className="w-3 h-3" />
+                  Add Field
+                </button>
+              </div>
+
+              {extractionTemplate.length === 0 ? (
+                <div className="mt-6 text-center border border-dashed border-neutral-800 rounded-xl p-6">
+                  <Tag className="w-8 h-8 mx-auto mb-2 text-neutral-700" />
+                  <p className="text-xs text-neutral-500">
+                    Define labeled fields to extract from each item
+                  </p>
+                  <p className="text-xs text-neutral-600 mt-2">
+                    Example: title, price, description
+                  </p>
+                </div>
+              ) : (
+                extractionTemplate.map((field, idx) => (
+                  <div
+                    key={field.id}
+                    className="bg-neutral-800 border border-neutral-700 rounded-lg p-3 space-y-2"
+                  >
+                    <div className="flex items-center justify-between">
+                      <span className="text-[10px] text-neutral-600 font-mono">
+                        Field {idx + 1}
+                      </span>
+                      <button
+                        onClick={() => removeExtractionField(field.id)}
+                        className="text-neutral-600 hover:text-red-400"
+                      >
+                        <Trash2 className="w-3 h-3" />
+                      </button>
+                    </div>
+
+                    <input
+                      type="text"
+                      placeholder="Label (e.g., title, price)"
+                      value={field.label}
+                      onChange={(e) => updateExtractionField(field.id, { label: e.target.value })}
+                      className="w-full bg-neutral-950 border border-neutral-700 text-[11px] rounded
+                        px-2 py-1.5 text-neutral-300 focus:outline-none focus:border-amber-500 placeholder-neutral-600"
+                    />
+
+                    <input
+                      type="text"
+                      placeholder="Selector (e.g., .title, h2)"
+                      value={field.selector}
+                      onChange={(e) => updateExtractionField(field.id, { selector: e.target.value })}
+                      className="w-full bg-neutral-950 border border-neutral-700 text-[10px] rounded
+                        px-2 py-1.5 text-neutral-300 focus:outline-none focus:border-amber-500 placeholder-neutral-600 font-mono"
+                    />
+
+                    <select
+                      value={field.attribute}
+                      onChange={(e) => updateExtractionField(field.id, { attribute: e.target.value as any })}
+                      className="w-full bg-neutral-950 border border-neutral-700 text-[11px] rounded
+                        px-2 py-1.5 text-neutral-300 focus:outline-none focus:border-amber-500 cursor-pointer"
+                    >
+                      <option value="textContent">Text Content</option>
+                      <option value="value">Value (inputs)</option>
+                      <option value="href">Link (href)</option>
+                      <option value="src">Image (src)</option>
+                      <option value="innerHTML">Inner HTML</option>
                     </select>
                   </div>
+                ))
+              )}
+            </div>
+          )}
+
+          {/* ─── DATA TAB ──────────────────────────────────────────────── */}
+          {activeTab === 'data' && (
+            <div className="space-y-2">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[10px] uppercase text-neutral-500 font-bold tracking-widest">
+                  Scraped Results
+                </span>
+                {scrapedData.length > 0 && (
                   <button
-                    onClick={() => removeStep(step.id)}
-                    className="text-neutral-600 hover:text-red-400 transition-colors shrink-0"
+                    onClick={exportData}
+                    className="flex items-center gap-1 px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-[10px] text-blue-400 rounded border border-neutral-700 transition-colors"
                   >
-                    <Trash2 className="w-3 h-3" />
+                    <Download className="w-3 h-3" />
+                    Export JSON
                   </button>
-                </div>
-
-                {/* Selector pill */}
-                <div className="mt-1.5 text-[10px] text-neutral-500 font-mono truncate bg-neutral-950/60
-                  px-2 py-0.5 rounded border border-neutral-800">
-                  {step.selector || '—'}
-                </div>
-
-                {/* Fill value input */}
-                {step.action === 'fill' && (
-                  <input
-                    type="text"
-                    placeholder="Value to fill…"
-                    value={step.value || ''}
-                    onChange={(e) => updateStep(step.id, { value: e.target.value })}
-                    className="w-full mt-1.5 bg-neutral-950 border border-neutral-700 text-[11px] rounded
-                      px-2 py-1 text-neutral-300 focus:outline-none focus:border-blue-500 placeholder-neutral-600"
-                  />
-                )}
-
-                {/* Extracted text preview */}
-                {step.action === 'extract' && step.text && (
-                  <div className="mt-1.5 text-[10px] text-neutral-500 italic truncate
-                    border-l-2 border-amber-500/30 pl-1.5">
-                    "{step.text}"
-                  </div>
                 )}
               </div>
-            ))
+
+              {scrapedData.length === 0 ? (
+                <div className="mt-6 text-center border border-dashed border-neutral-800 rounded-xl p-6">
+                  <Table className="w-8 h-8 mx-auto mb-2 text-neutral-700" />
+                  <p className="text-xs text-neutral-500">
+                    No data yet. Click "Launch Scraper" to extract data.
+                  </p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {scrapedData.map((record, idx) => (
+                    <div
+                      key={idx}
+                      className="bg-neutral-800 border border-neutral-700 rounded-lg p-3 space-y-1.5"
+                    >
+                      <div className="text-[10px] text-neutral-600 font-mono mb-1">
+                        Record {idx + 1}
+                      </div>
+                      {Object.entries(record).map(([key, value]) => (
+                        <div key={key} className="flex gap-2">
+                          <span className="text-[10px] text-amber-400 font-semibold shrink-0">
+                            {key}:
+                          </span>
+                          <span className="text-[10px] text-neutral-300 truncate">
+                            {String(value)}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
         </div>
 
@@ -339,7 +688,7 @@ export default function Home() {
 
           {currentUrl && (
             <span className="text-[11px] text-neutral-500 font-mono truncate max-w-[260px]" title={currentUrl}>
-              {currentUrl}
+              📍 {currentUrl}
             </span>
           )}
         </header>
