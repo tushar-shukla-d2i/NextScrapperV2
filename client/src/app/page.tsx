@@ -457,6 +457,32 @@ export default function Home() {
                         </button>
                       </div>
 
+                      {/* ── Action type switcher (click / fill / extract) ── */}
+                      {(step.action === 'click' || step.action === 'fill' || step.action === 'extract') && (
+                        <div className="mt-2 flex gap-1">
+                          {(['click', 'fill', 'extract'] as const).map((a) => {
+                            const cfgMap = {
+                              click:   { label: 'Click',   icon: MousePointerClick, active: 'bg-emerald-500/20 border-emerald-500/50 text-emerald-400', idle: 'bg-neutral-900 border-neutral-700 text-neutral-500 hover:text-neutral-300' },
+                              fill:    { label: 'Fill',    icon: Type,              active: 'bg-blue-500/20 border-blue-500/50 text-blue-400',           idle: 'bg-neutral-900 border-neutral-700 text-neutral-500 hover:text-neutral-300' },
+                              extract: { label: 'Extract', icon: ScanSearch,        active: 'bg-amber-500/20 border-amber-500/50 text-amber-400',        idle: 'bg-neutral-900 border-neutral-700 text-neutral-500 hover:text-neutral-300' },
+                            };
+                            const cfg = cfgMap[a];
+                            const Icon = cfg.icon;
+                            const isActive = step.action === a;
+                            return (
+                              <button
+                                key={a}
+                                onClick={() => updateStep(step.id, { action: a })}
+                                className={`flex-1 flex items-center justify-center gap-1 py-1 text-[9px] font-bold border rounded transition-all ${isActive ? cfg.active : cfg.idle}`}
+                              >
+                                <Icon className="w-2.5 h-2.5" />
+                                {cfg.label}
+                              </button>
+                            );
+                          })}
+                        </div>
+                      )}
+
                       {/* Selector for click/fill/extract */}
                       {(step.action === 'click' || step.action === 'fill' || step.action === 'extract') && (
                         <div className="mt-1.5 text-[10px] text-neutral-500 font-mono truncate bg-neutral-950/60
@@ -477,11 +503,22 @@ export default function Home() {
                         />
                       )}
 
-                      {/* Extracted text preview */}
-                      {step.action === 'extract' && step.text && (
-                        <div className="mt-1.5 text-[10px] text-neutral-500 italic truncate
-                          border-l-2 border-amber-500/30 pl-1.5">
-                          "{step.text}"
+                      {/* Extract: label field + text preview */}
+                      {step.action === 'extract' && (
+                        <div className="mt-1.5 space-y-1.5">
+                          <input
+                            type="text"
+                            placeholder="Label (e.g., title, price)"
+                            value={step.label || ''}
+                            onChange={(e) => updateStep(step.id, { label: e.target.value })}
+                            className="w-full bg-neutral-950 border border-neutral-700 text-[11px] rounded
+                              px-2 py-1 text-neutral-300 focus:outline-none focus:border-amber-500 placeholder-neutral-600"
+                          />
+                          {step.text && (
+                            <div className="text-[10px] text-neutral-500 italic truncate border-l-2 border-amber-500/30 pl-1.5">
+                              "{step.text}"
+                            </div>
+                          )}
                         </div>
                       )}
 

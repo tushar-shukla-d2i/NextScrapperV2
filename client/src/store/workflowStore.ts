@@ -6,6 +6,7 @@ export type Step = {
   selector?: string;
   value?: string;
   text?: string;
+  label?: string;        // for extract steps — the field name to use in results
   // For iterate
   itemSelector?: string;
   iterateSteps?: Omit<Step, 'id'>[];
