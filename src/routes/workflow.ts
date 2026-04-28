@@ -20,16 +20,24 @@ router.get('/', async (req, res) => {
 router.post('/', async (req, res) => {
   try {
     const { name, config } = req.body;
+    if (!config || typeof config !== 'object') {
+      return res.status(400).json({ error: 'Invalid config payload.' });
+    }
+
+    // Ensure JSON-safe payload for Prisma Json field.
+    const safeConfig = JSON.parse(JSON.stringify(config));
+
     const workflow = await prisma.workflow.create({
       data: {
-        name,
+        name: typeof name === 'string' && name.trim() ? name.trim() : 'Visual Flow',
         // Assuming config is a JSON object defining steps
-        config
+        config: safeConfig
       }
     });
     res.status(201).json(workflow);
-  } catch (error) {
-    res.status(500).json({ error: 'Failed to create workflow' });
+  } catch (error: any) {
+    console.error('[workflow:create] error:', error?.message || error);
+    res.status(500).json({ error: error?.message || 'Failed to create workflow' });
   }
 });
 

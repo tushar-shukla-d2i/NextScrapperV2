@@ -30,7 +30,70 @@ const INJECTION_SCRIPT = `
       }).slice(0, 3);
       if (parts.length) return tag + '.' + parts.join('.');
     }
+    if (tag === 'a') {
+      var parent = el.parentElement;
+      if (parent) {
+        var anchors = parent.querySelectorAll('a');
+        if (anchors.length > 1) {
+          var idx = 1;
+          for (var i = 0; i < anchors.length; i++) {
+            if (anchors[i] === el) {
+              idx = i + 1;
+              break;
+            }
+          }
+          return 'a:nth-of-type(' + idx + ')';
+        }
+      }
+      return 'a[href]';
+    }
     return tag;
+  }
+
+  function buildGeneralSelector(el) {
+    if (!el || !el.tagName) return '';
+    var tag = el.tagName.toLowerCase();
+    if (el.id) return tag + '#' + el.id;
+    var dataCase = el.getAttribute && el.getAttribute('data-case-id');
+    if (dataCase) return tag + '[data-case-id]';
+    if (el.className && typeof el.className === 'string') {
+      var parts = el.className.split(' ').filter(function(c) {
+        return c.length > 0 && c !== 'ag-hover' && !/[0-9]{4,}/.test(c);
+      }).slice(0, 2);
+      if (parts.length) return tag + '.' + parts.join('.');
+    }
+    return tag;
+  }
+
+  function findRepeatedAncestor(el) {
+    var cur = el;
+    for (var depth = 0; depth < 8; depth++) {
+      if (!cur || !cur.parentElement) break;
+      var parent = cur.parentElement;
+      var sig = buildGeneralSelector(cur);
+      if (!sig) break;
+      try {
+        var count = parent.querySelectorAll(':scope > ' + sig).length;
+        if (count >= 2) {
+          return cur;
+        }
+      } catch (_) {}
+      cur = parent;
+    }
+    return null;
+  }
+
+  function guessLoopHint(el) {
+    var card = findRepeatedAncestor(el);
+    if (!card) return null;
+    var itemSelector = buildGeneralSelector(card);
+    var container = card.parentElement;
+    var containerSelector = container ? buildGeneralSelector(container) : 'body';
+    if (!itemSelector) return null;
+    return {
+      itemSelector: itemSelector,
+      containerSelector: containerSelector || 'body'
+    };
   }
 
   /* ---------- Resolve href for any click (walk up to <a>) ---------- */
@@ -97,7 +160,8 @@ const INJECTION_SCRIPT = `
       value:   val,
       href:    href,
       isNav:   nav,
-      isInput: isInput
+      isInput: isInput,
+      loopHint: guessLoopHint(el)
     }, '*');
   }, true);
 

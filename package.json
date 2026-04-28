@@ -5,6 +5,7 @@
   "main": "index.js",
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
+    "dev:all": "docker compose up -d && concurrently -k -n api,client -c cyan,magenta \"npm run dev\" \"npm run dev --prefix client\"",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -29,6 +30,7 @@
     "@types/express": "^5.0.6",
     "@types/node": "^25.5.0",
     "@types/pg": "^8.20.0",
+    "concurrently": "^9.2.1",
     "prisma": "^7.6.0",
     "ts-node-dev": "^2.0.0",
     "typescript": "^6.0.2"

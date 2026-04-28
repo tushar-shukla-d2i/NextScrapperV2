@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-import { useWorkflowStore } from '../store/workflowStore';
+import { useWorkflowStore, type Step } from '../store/workflowStore';
 import { io } from 'socket.io-client';
 import {
   Share2, Trash2, Play, ServerCrash, Loader2, MousePointerClick,
@@ -29,6 +29,8 @@ export default function Home() {
   const [activeTab, setActiveTab] = useState<'steps' | 'template' | 'data'>('steps');
   const [showAddStepMenu, setShowAddStepMenu] = useState(false);
   const [expandedIterateSteps, setExpandedIterateSteps] = useState<Set<string>>(new Set());
+  const [activeIterateCaptureId, setActiveIterateCaptureId] = useState<string | null>(null);
+  const [activeIterateForMenu, setActiveIterateForMenu] = useState<string | null>(null);
   // JS step test runner state: stepId → { running, result, error }
   const [jsTestResults, setJsTestResults] = useState<Record<string, { running: boolean; result?: string; error?: string }>>({});
 
@@ -36,12 +38,84 @@ export default function Home() {
   const sessionIdRef = useRef<string | null>(null);
   const addStepRef = useRef(addStep);
   const setTargetRef = useRef(setTargetUrl);
+  const updateStepRef = useRef(updateStep);
+  const stepsRef = useRef(steps);
+  const expandedIterateRef = useRef(expandedIterateSteps);
+  const activeIterateCaptureRef = useRef<string | null>(null);
   const inputDebounce = useRef<NodeJS.Timeout | null>(null);
 
   // Keep refs in sync with latest values
   useEffect(() => { sessionIdRef.current = sessionId; }, [sessionId]);
   useEffect(() => { addStepRef.current = addStep; }, [addStep]);
   useEffect(() => { setTargetRef.current = setTargetUrl; }, [setTargetUrl]);
+  useEffect(() => { updateStepRef.current = updateStep; }, [updateStep]);
+  useEffect(() => { stepsRef.current = steps; }, [steps]);
+  useEffect(() => { expandedIterateRef.current = expandedIterateSteps; }, [expandedIterateSteps]);
+  useEffect(() => { activeIterateCaptureRef.current = activeIterateCaptureId; }, [activeIterateCaptureId]);
+
+  useEffect(() => {
+    if (!activeIterateCaptureId) return;
+    const stillExists = steps.some(s => s.id === activeIterateCaptureId && s.action === 'iterate');
+    if (!stillExists) setActiveIterateCaptureId(null);
+  }, [steps, activeIterateCaptureId]);
+
+  const appendStepToActiveIterate = (nextStep: Omit<Step, 'id'>) => {
+    const iterateCandidateIds = Array.from(expandedIterateRef.current);
+    const preferredId = activeIterateCaptureRef.current;
+    const activeIterateId = preferredId && iterateCandidateIds.includes(preferredId)
+      ? preferredId
+      : iterateCandidateIds[iterateCandidateIds.length - 1];
+
+    const iterateStep = stepsRef.current.find((s) => s.id === activeIterateId && s.action === 'iterate');
+    if (!iterateStep) {
+      // If no iterate is expanded, this is a normal top-level step.
+      if (iterateCandidateIds.length === 0) {
+        addStepRef.current(nextStep);
+      }
+      return;
+    }
+
+    updateStepRef.current(activeIterateId, {
+      iterateSteps: [...(iterateStep.iterateSteps || []), nextStep],
+    });
+  };
+
+  const getActiveIterateStep = () => {
+    const expandedIds = Array.from(expandedIterateRef.current);
+    const preferredId = activeIterateCaptureRef.current;
+    const activeIterateId = preferredId && expandedIds.includes(preferredId)
+      ? preferredId
+      : expandedIds[expandedIds.length - 1];
+    if (!activeIterateId) return null;
+    const step = stepsRef.current.find((s) => s.id === activeIterateId && s.action === 'iterate');
+    if (!step) return null;
+    return { id: activeIterateId, step };
+  };
+
+  const addStepToSpecificIterate = (iterateId: string, nextStep: Omit<Step, 'id'>) => {
+    const iterateStep = stepsRef.current.find((s) => s.id === iterateId && s.action === 'iterate');
+    if (!iterateStep) return;
+
+    updateStepRef.current(iterateId, {
+      iterateSteps: [...(iterateStep.iterateSteps || []), nextStep],
+    });
+  };
+
+  const updateIterateSubStep = (iterateId: string, subStepIndex: number, patch: Partial<Omit<Step, 'id'>>) => {
+    const iterateStep = stepsRef.current.find((s) => s.id === iterateId && s.action === 'iterate');
+    if (!iterateStep) return;
+    const current = iterateStep.iterateSteps || [];
+    if (!current[subStepIndex]) return;
+    const next = current.map((s, idx) => (idx === subStepIndex ? { ...s, ...patch } : s));
+    updateStepRef.current(iterateId, { iterateSteps: next });
+  };
+
+  const removeIterateSubStep = (iterateId: string, subStepIndex: number) => {
+    const iterateStep = stepsRef.current.find((s) => s.id === iterateId && s.action === 'iterate');
+    if (!iterateStep) return;
+    const next = (iterateStep.iterateSteps || []).filter((_, idx) => idx !== subStepIndex);
+    updateStepRef.current(iterateId, { iterateSteps: next });
+  };
 
   // Socket
   useEffect(() => {
@@ -57,13 +131,12 @@ export default function Home() {
       if (!data || !data.type) return;
 
       const sid = sessionIdRef.current;
-      const doAdd = addStepRef.current;
       const doNavUrl = setTargetRef.current;
 
       // ────── Input / typing ──────────────────────────────────────────────
       if (data.type === 'USER_INPUT_CHANGE') {
         // Record fill step immediately (upsert handled by store)
-        doAdd({ action: 'fill', selector: data.selector, value: data.value });
+        appendStepToActiveIterate({ action: 'fill', selector: data.selector, value: data.value });
 
         // Debounce fill sync to backend so it's ready when the user clicks Submit
         if (!sid) return;
@@ -80,16 +153,31 @@ export default function Home() {
 
       // ────── Click ───────────────────────────────────────────────────────
       if (data.type === 'USER_CLICKED_ELEMENT') {
-        const { tagName, selector, text, value, isNav, isInput, href } = data;
+        const { tagName, selector, text, value, isNav, isInput, href, loopHint } = data;
 
         /* Clicking an input/textarea → record fill stub (no backend call) */
         if (isInput) {
-          doAdd({ action: 'fill', selector, value: value || '' });
+          appendStepToActiveIterate({ action: 'fill', selector, value: value || '' });
           return;
         }
 
+        // If an iterate block is active and not configured yet, first card click configures loop selectors.
+        const activeIterate = getActiveIterateStep();
+        if (activeIterate && loopHint) {
+          const needsContainer = !activeIterate.step.selector || activeIterate.step.selector.trim() === '';
+          const needsItem = !activeIterate.step.itemSelector || activeIterate.step.itemSelector.trim() === '';
+          if (needsContainer || needsItem) {
+            updateStepRef.current(activeIterate.id, {
+              selector: needsContainer ? loopHint.containerSelector : activeIterate.step.selector,
+              itemSelector: needsItem ? loopHint.itemSelector : activeIterate.step.itemSelector
+            });
+            // Don't add this click as a loop action; treat it as loop-target selection.
+            return;
+          }
+        }
+
         /* All other clicks: always record the step */
-        doAdd({ action: 'click', selector, text });
+        appendStepToActiveIterate({ action: 'click', selector, text });
 
         /* Only navigation clicks need backend sync + iframe refresh */
         if (!isNav || !sid) return;
@@ -191,17 +279,29 @@ export default function Home() {
     setCurrentUrl(targetUrl);
 
     try {
+      if (!targetUrl) {
+        throw new Error('Target URL is required before launching scraper.');
+      }
+
       const createRes = await fetch(`${API}/api/workflows`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           name: 'Visual Flow',
-          config: { steps, url: targetUrl, extractionTemplate }
+          config: JSON.parse(JSON.stringify({ steps, url: targetUrl, extractionTemplate }))
         })
       });
       const workflow = await createRes.json();
+      if (!createRes.ok || !workflow?.id) {
+        throw new Error(workflow?.error || 'Failed to create workflow.');
+      }
+
       const runRes = await fetch(`${API}/api/workflows/run/${workflow.id}`, { method: 'POST' });
-      const { jobId } = await runRes.json();
+      const runData = await runRes.json();
+      if (!runRes.ok || !runData?.jobId) {
+        throw new Error(runData?.error || 'Failed to queue workflow run.');
+      }
+      const { jobId } = runData;
 
       if (socket) {
         // Remove old listeners to avoid duplicates on re-runs
@@ -225,13 +325,13 @@ export default function Home() {
           setActiveTab('data');
         });
       }
-    } catch {
-      setRunLogs(prev => [...prev, '❌ Failed to execute workflow.']);
+    } catch (err: any) {
+      setRunLogs(prev => [...prev, `❌ ${err?.message || 'Failed to execute workflow.'}`]);
     }
   };
 
   // ── Manual step additions ────────────────────────────────────────────────
-  const manualAddStep = (stepType: 'iterate' | 'javascript' | 'wait') => {
+  const manualAddStep = (stepType: 'iterate' | 'javascript' | 'wait' | 'click' | 'fill' | 'extract') => {
     if (stepType === 'iterate') {
       addStep({
         action: 'iterate',
@@ -240,16 +340,33 @@ export default function Home() {
         iterateSteps: []
       });
     } else if (stepType === 'javascript') {
-      addStep({
+      const step = {
         action: 'javascript',
         jsCode: '// Execute custom JavaScript\n// Return value will be used in workflow\nreturn document.querySelectorAll(\'.item\').length;'
-      });
+      } as Omit<Step, 'id'>;
+      if (activeIterateForMenu) addStepToSpecificIterate(activeIterateForMenu, step);
+      else appendStepToActiveIterate(step);
     } else if (stepType === 'wait') {
-      addStep({
+      const step = {
         action: 'wait',
         waitMs: 1000
-      });
+      } as Omit<Step, 'id'>;
+      if (activeIterateForMenu) addStepToSpecificIterate(activeIterateForMenu, step);
+      else appendStepToActiveIterate(step);
+    } else if (stepType === 'click') {
+      const step = { action: 'click', selector: '' } as Omit<Step, 'id'>;
+      if (activeIterateForMenu) addStepToSpecificIterate(activeIterateForMenu, step);
+      else appendStepToActiveIterate(step);
+    } else if (stepType === 'fill') {
+      const step = { action: 'fill', selector: '', value: '' } as Omit<Step, 'id'>;
+      if (activeIterateForMenu) addStepToSpecificIterate(activeIterateForMenu, step);
+      else appendStepToActiveIterate(step);
+    } else if (stepType === 'extract') {
+      const step = { action: 'extract', selector: '', label: '' } as Omit<Step, 'id'>;
+      if (activeIterateForMenu) addStepToSpecificIterate(activeIterateForMenu, step);
+      else appendStepToActiveIterate(step);
     }
+    setActiveIterateForMenu(null);
     setShowAddStepMenu(false);
   };
 
@@ -288,8 +405,12 @@ export default function Home() {
       const next = new Set(prev);
       if (next.has(id)) {
         next.delete(id);
+        if (activeIterateCaptureRef.current === id) {
+          setActiveIterateCaptureId(null);
+        }
       } else {
         next.add(id);
+        setActiveIterateCaptureId(id);
       }
       return next;
     });
@@ -377,7 +498,10 @@ export default function Home() {
                   )}
                   <div className="relative">
                     <button
-                      onClick={() => setShowAddStepMenu(!showAddStepMenu)}
+                      onClick={() => {
+                        setActiveIterateForMenu(null);
+                        setShowAddStepMenu(!showAddStepMenu);
+                      }}
                       className="flex items-center gap-1 px-2 py-0.5 bg-neutral-800 hover:bg-neutral-700 text-[10px] text-emerald-400 rounded border border-neutral-700 transition-colors"
                     >
                       <Plus className="w-3 h-3" />
@@ -405,6 +529,13 @@ export default function Home() {
                         >
                           <Clock className="w-3.5 h-3.5 text-cyan-400" />
                           <span>Wait / Delay</span>
+                        </button>
+                        <button
+                          onClick={() => manualAddStep('extract')}
+                          className="w-full flex items-center gap-2 px-3 py-2 text-[11px] hover:bg-neutral-700 text-left transition-colors"
+                        >
+                          <ScanSearch className="w-3.5 h-3.5 text-amber-400" />
+                          <span>Extract Field</span>
                         </button>
                       </div>
                     )}
@@ -601,13 +732,84 @@ export default function Home() {
 
                     {/* Nested iterate steps */}
                     {step.action === 'iterate' && expandedIterateSteps.has(step.id) && (
-                      <div className="ml-6 pl-3 border-l-2 border-purple-500/30 space-y-1">
+                      <div className="ml-6 pl-3 border-l-2 border-purple-500/30 space-y-2">
                         <div className="text-[9px] text-neutral-600 uppercase tracking-wider mb-1">
                           Steps to repeat for each item:
                         </div>
                         <div className="text-[10px] text-neutral-500 bg-neutral-900 rounded px-2 py-1.5 border border-neutral-800">
-                          Add steps by clicking elements in preview while this loop is expanded
+                          Click in preview or add from menu to build loop substeps.
                         </div>
+                        <button
+                          onClick={() => {
+                            setActiveIterateForMenu(step.id);
+                            setShowAddStepMenu(true);
+                          }}
+                          className="text-[10px] px-2 py-1 rounded border border-purple-500/40 text-purple-300 bg-purple-500/10 hover:bg-purple-500/20"
+                        >
+                          + Add Step To This Loop
+                        </button>
+                        {(step.iterateSteps || []).length > 0 && (
+                          <div className="space-y-1.5">
+                            {(step.iterateSteps || []).map((subStep, subIdx) => (
+                              <div key={`${step.id}-sub-${subIdx}`} className="bg-neutral-900/70 border border-neutral-800 rounded p-2 space-y-1">
+                                <div className="flex items-center justify-between">
+                                  <span className="text-[9px] text-neutral-400 font-mono">{String(subIdx + 1).padStart(2, '0')} • {subStep.action.toUpperCase()}</span>
+                                  <button
+                                    onClick={() => removeIterateSubStep(step.id, subIdx)}
+                                    className="text-neutral-600 hover:text-red-400"
+                                  >
+                                    <Trash2 className="w-3 h-3" />
+                                  </button>
+                                </div>
+                                {(subStep.action === 'click' || subStep.action === 'fill' || subStep.action === 'extract') && (
+                                  <input
+                                    type="text"
+                                    placeholder="CSS selector"
+                                    value={subStep.selector || ''}
+                                    onChange={(e) => updateIterateSubStep(step.id, subIdx, { selector: e.target.value })}
+                                    className="w-full bg-neutral-950 border border-neutral-700 text-[10px] rounded px-2 py-1 text-neutral-300"
+                                  />
+                                )}
+                                {subStep.action === 'fill' && (
+                                  <input
+                                    type="text"
+                                    placeholder="Value"
+                                    value={subStep.value || ''}
+                                    onChange={(e) => updateIterateSubStep(step.id, subIdx, { value: e.target.value })}
+                                    className="w-full bg-neutral-950 border border-neutral-700 text-[10px] rounded px-2 py-1 text-neutral-300"
+                                  />
+                                )}
+                                {subStep.action === 'extract' && (
+                                  <input
+                                    type="text"
+                                    placeholder="Field label"
+                                    value={subStep.label || ''}
+                                    onChange={(e) => updateIterateSubStep(step.id, subIdx, { label: e.target.value })}
+                                    className="w-full bg-neutral-950 border border-neutral-700 text-[10px] rounded px-2 py-1 text-neutral-300"
+                                  />
+                                )}
+                                {subStep.action === 'wait' && (
+                                  <input
+                                    type="number"
+                                    placeholder="Milliseconds"
+                                    value={subStep.waitMs || 1000}
+                                    onChange={(e) => updateIterateSubStep(step.id, subIdx, { waitMs: parseInt(e.target.value) || 1000 })}
+                                    className="w-full bg-neutral-950 border border-neutral-700 text-[10px] rounded px-2 py-1 text-neutral-300"
+                                  />
+                                )}
+                                {subStep.action === 'javascript' && (
+                                  <textarea
+                                    value={subStep.jsCode || ''}
+                                    onChange={(e) => updateIterateSubStep(step.id, subIdx, { jsCode: e.target.value })}
+                                    placeholder="// JS for each item"
+                                    className="w-full bg-neutral-950 border border-neutral-700 text-[10px] rounded px-2 py-1.5 text-neutral-300 font-mono resize-none"
+                                    rows={3}
+                                  />
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                        )}
                       </div>
                     )}
                   </div>
