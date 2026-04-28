@@ -68,15 +68,31 @@ export default function Home() {
 
     const iterateStep = stepsRef.current.find((s) => s.id === activeIterateId && s.action === 'iterate');
     if (!iterateStep) {
-      // If no iterate is expanded, this is a normal top-level step.
-      if (iterateCandidateIds.length === 0) {
-        addStepRef.current(nextStep);
-      }
+      // No valid iterate is active — add as a normal top-level step.
+      addStepRef.current(nextStep);
       return;
     }
 
-    updateStepRef.current(activeIterateId, {
-      iterateSteps: [...(iterateStep.iterateSteps || []), nextStep],
+    const currentSubSteps = iterateStep.iterateSteps || [];
+
+    // Upsert fill sub-steps by selector so each keystroke doesn't create duplicates.
+    if (nextStep.action === 'fill' && nextStep.selector) {
+      const existingIdx = currentSubSteps.findIndex(
+        (s) => s.action === 'fill' && s.selector === nextStep.selector
+      );
+      if (existingIdx >= 0) {
+        if (nextStep.value !== undefined && nextStep.value !== '') {
+          const updated = currentSubSteps.map((s, i) =>
+            i === existingIdx ? { ...s, value: nextStep.value } : s
+          );
+          updateStepRef.current(activeIterateId!, { iterateSteps: updated });
+        }
+        return;
+      }
+    }
+
+    updateStepRef.current(activeIterateId!, {
+      iterateSteps: [...currentSubSteps, nextStep],
     });
   };
 
@@ -177,7 +193,9 @@ export default function Home() {
         }
 
         /* All other clicks: always record the step */
-        appendStepToActiveIterate({ action: 'click', selector, text });
+        // Persist href in `value` so queued runs can navigate directly
+        // instead of relying on potentially brittle selector clicks.
+        appendStepToActiveIterate({ action: 'click', selector, text, value: href || '' });
 
         /* Only navigation clicks need backend sync + iframe refresh */
         if (!isNav || !sid) return;
@@ -310,6 +328,32 @@ export default function Home() {
 
         socket.emit('join_job', jobId);
 
+        let resultsReceived = false;
+
+        // Polling fallback — if the scraped_data socket event fires before the room join
+        // is acknowledged (race condition), we fetch the result from the DB every 4 seconds.
+        const poll = setInterval(async () => {
+          if (resultsReceived) { clearInterval(poll); return; }
+          try {
+            const r = await fetch(`${API}/api/workflows/run/${jobId}/result`);
+            const d = await r.json();
+            if (d.status === 'COMPLETED') {
+              clearInterval(poll);
+              resultsReceived = true;
+              const results: any[] = (d.output as any)?.results || [];
+              setScrapedData(results);
+              setRunLogs(prev => [
+                ...prev,
+                `✅ Extracted ${results.length} record${results.length !== 1 ? 's' : ''}`
+              ]);
+              setActiveTab('data');
+            } else if (d.status === 'FAILED') {
+              clearInterval(poll);
+              setRunLogs(prev => [...prev, `❌ Job failed: ${d.error || 'unknown error'}`]);
+            }
+          } catch { /* ignore poll errors */ }
+        }, 4000);
+
         socket.on('log', (logInfo: any) => {
           setRunLogs(prev => [
             ...prev,
@@ -318,10 +362,11 @@ export default function Home() {
         });
 
         socket.on('scraped_data', (data: any) => {
+          resultsReceived = true;
+          clearInterval(poll);
           const results = data.results || [];
           setScrapedData(results);
           setRunLogs(prev => [...prev, `✅ Extracted ${results.length} record${results.length !== 1 ? 's' : ''}`]);
-          // Auto-switch to data tab once results arrive
           setActiveTab('data');
         });
       }
@@ -336,7 +381,7 @@ export default function Home() {
       addStep({
         action: 'iterate',
         selector: '',
-        itemSelector: '.card, .item, [data-item]',
+        itemSelector: '',
         iterateSteps: []
       });
     } else if (stepType === 'javascript') {
@@ -424,6 +469,19 @@ export default function Home() {
     a.href = url;
     a.download = `scraped-data-${Date.now()}.json`;
     a.click();
+  };
+
+  const selectorStrength = (selector?: string): { label: string; cls: string } | null => {
+    if (!selector || !selector.trim()) return null;
+    const s = selector.toLowerCase();
+    if (/:has-text\(/.test(s)) return { label: 'text', cls: 'text-fuchsia-300 border-fuchsia-500/40 bg-fuchsia-500/10' };
+    if (/\[name=/.test(s)) return { label: 'name', cls: 'text-emerald-300 border-emerald-500/40 bg-emerald-500/10' };
+    if (/\[id=|#/.test(s)) return { label: 'id', cls: 'text-cyan-300 border-cyan-500/40 bg-cyan-500/10' };
+    if (/\[data-/.test(s)) return { label: 'data-*', cls: 'text-violet-300 border-violet-500/40 bg-violet-500/10' };
+    if (/\[aria-/.test(s)) return { label: 'aria', cls: 'text-indigo-300 border-indigo-500/40 bg-indigo-500/10' };
+    if (/\[placeholder=|\[title=/.test(s)) return { label: 'hint', cls: 'text-blue-300 border-blue-500/40 bg-blue-500/10' };
+    if (/\./.test(s)) return { label: 'class', cls: 'text-amber-300 border-amber-500/40 bg-amber-500/10' };
+    return { label: 'tag', cls: 'text-neutral-300 border-neutral-600 bg-neutral-700/30' };
   };
 
   return (
@@ -621,6 +679,17 @@ export default function Home() {
                           {step.selector || '—'}
                         </div>
                       )}
+                      {(step.action === 'click' || step.action === 'fill' || step.action === 'extract') && (() => {
+                        const info = selectorStrength(step.selector);
+                        if (!info) return null;
+                        return (
+                          <div className="mt-1">
+                            <span className={`inline-flex items-center px-1.5 py-0.5 rounded border text-[9px] uppercase tracking-wider ${info.cls}`}>
+                              selector: {info.label}
+                            </span>
+                          </div>
+                        );
+                      })()}
 
                       {/* Fill value input */}
                       {step.action === 'fill' && (
@@ -634,7 +703,7 @@ export default function Home() {
                         />
                       )}
 
-                      {/* Extract: label field + text preview */}
+                      {/* Extract: label field + attribute + text preview */}
                       {step.action === 'extract' && (
                         <div className="mt-1.5 space-y-1.5">
                           <input
@@ -645,6 +714,18 @@ export default function Home() {
                             className="w-full bg-neutral-950 border border-neutral-700 text-[11px] rounded
                               px-2 py-1 text-neutral-300 focus:outline-none focus:border-amber-500 placeholder-neutral-600"
                           />
+                          <select
+                            value={step.attribute || 'textContent'}
+                            onChange={(e) => updateStep(step.id, { attribute: e.target.value as any })}
+                            className="w-full bg-neutral-950 border border-neutral-700 text-[11px] rounded
+                              px-2 py-1.5 text-neutral-300 focus:outline-none focus:border-amber-500 cursor-pointer"
+                          >
+                            <option value="textContent">Text Content</option>
+                            <option value="value">Value (inputs)</option>
+                            <option value="href">Link (href)</option>
+                            <option value="src">Image (src)</option>
+                            <option value="innerHTML">Inner HTML</option>
+                          </select>
                           {step.text && (
                             <div className="text-[10px] text-neutral-500 italic truncate border-l-2 border-amber-500/30 pl-1.5">
                               "{step.text}"
@@ -762,13 +843,31 @@ export default function Home() {
                                   </button>
                                 </div>
                                 {(subStep.action === 'click' || subStep.action === 'fill' || subStep.action === 'extract') && (
-                                  <input
-                                    type="text"
-                                    placeholder="CSS selector"
-                                    value={subStep.selector || ''}
-                                    onChange={(e) => updateIterateSubStep(step.id, subIdx, { selector: e.target.value })}
-                                    className="w-full bg-neutral-950 border border-neutral-700 text-[10px] rounded px-2 py-1 text-neutral-300"
-                                  />
+                                  <>
+                                    <input
+                                      type="text"
+                                      placeholder="CSS selector"
+                                      value={subStep.selector || ''}
+                                      onChange={(e) => updateIterateSubStep(step.id, subIdx, { selector: e.target.value })}
+                                      className="w-full bg-neutral-950 border border-neutral-700 text-[10px] rounded px-2 py-1 text-neutral-300"
+                                    />
+                                    {(() => {
+                                      const info = selectorStrength(subStep.selector);
+                                      if (!info) return null;
+                                      return (
+                                        <div className="space-y-1">
+                                          <span className={`inline-flex items-center px-1.5 py-0.5 rounded border text-[9px] uppercase tracking-wider ${info.cls}`}>
+                                            selector: {info.label}
+                                          </span>
+                                          {step.action === 'iterate' && /:has-text\(|:text\(/i.test(subStep.selector || '') && (
+                                            <div className="text-[9px] text-purple-300/90 bg-purple-500/10 border border-purple-500/30 rounded px-1.5 py-1">
+                                              Loop note: text filters like <span className="font-mono">:has-text(...)</span> are ignored per item during run.
+                                            </div>
+                                          )}
+                                        </div>
+                                      );
+                                    })()}
+                                  </>
                                 )}
                                 {subStep.action === 'fill' && (
                                   <input
@@ -780,13 +879,26 @@ export default function Home() {
                                   />
                                 )}
                                 {subStep.action === 'extract' && (
-                                  <input
-                                    type="text"
-                                    placeholder="Field label"
-                                    value={subStep.label || ''}
-                                    onChange={(e) => updateIterateSubStep(step.id, subIdx, { label: e.target.value })}
-                                    className="w-full bg-neutral-950 border border-neutral-700 text-[10px] rounded px-2 py-1 text-neutral-300"
-                                  />
+                                  <>
+                                    <input
+                                      type="text"
+                                      placeholder="Field label"
+                                      value={subStep.label || ''}
+                                      onChange={(e) => updateIterateSubStep(step.id, subIdx, { label: e.target.value })}
+                                      className="w-full bg-neutral-950 border border-neutral-700 text-[10px] rounded px-2 py-1 text-neutral-300"
+                                    />
+                                    <select
+                                      value={subStep.attribute || 'textContent'}
+                                      onChange={(e) => updateIterateSubStep(step.id, subIdx, { attribute: e.target.value as any })}
+                                      className="w-full bg-neutral-950 border border-neutral-700 text-[10px] rounded px-2 py-1 text-neutral-300 cursor-pointer"
+                                    >
+                                      <option value="textContent">Text Content</option>
+                                      <option value="value">Value (inputs)</option>
+                                      <option value="href">Link (href)</option>
+                                      <option value="src">Image (src)</option>
+                                      <option value="innerHTML">Inner HTML</option>
+                                    </select>
+                                  </>
                                 )}
                                 {subStep.action === 'wait' && (
                                   <input

@@ -66,4 +66,15 @@ router.post('/run/:id', async (req, res) => {
   }
 });
 
+// Fetch run status + output (fallback when socket event is missed)
+router.get('/run/:runId/result', async (req, res) => {
+  try {
+    const run = await prisma.workflowRun.findUnique({ where: { id: req.params.runId } });
+    if (!run) return res.status(404).json({ error: 'Run not found' });
+    res.json({ status: run.status, output: run.output, error: run.error });
+  } catch (error: any) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
 export default router;

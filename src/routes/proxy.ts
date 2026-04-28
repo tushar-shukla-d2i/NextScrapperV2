@@ -4,6 +4,32 @@ import { getProxiedHtml } from '../services/proxyService';
 
 const router = Router();
 
+const resolveTargetUrl = (rawHref: string | undefined, currentUrl: string): string | null => {
+  if (!rawHref) return null;
+  const href = rawHref.trim();
+  if (!href || href === '#' || href.startsWith('javascript:') || href.startsWith('mailto:') || href.startsWith('tel:')) {
+    return null;
+  }
+  try {
+    return new URL(href, currentUrl).toString();
+  } catch {
+    return null;
+  }
+};
+
+const clickWithFallbacks = async (page: any, selector: string) => {
+  const locator = page.locator(selector).first();
+  await locator.waitFor({ state: 'attached', timeout: 8000 });
+  await locator.scrollIntoViewIfNeeded().catch(() => {});
+  try {
+    await locator.click({ timeout: 8000 });
+  } catch {
+    await locator.click({ timeout: 8000, force: true }).catch(async () => {
+      await locator.evaluate((el: HTMLElement) => el.click());
+    });
+  }
+};
+
 // POST /api/proxy/session — open browser, load URL, return HTML snapshot
 router.post('/session', async (req, res) => {
   try {
@@ -42,11 +68,8 @@ router.post('/interact', async (req, res) => {
     }
 
     // ── Navigate via URL (preferred for links) ───────────────────────────
-    if (action === 'navigate' || (action === 'click' && href && href.startsWith('http'))) {
-      // Build absolute URL
-      const target = href && (href.startsWith('http') || href.startsWith('/'))
-        ? (href.startsWith('http') ? href : new URL(href, page.url()).href)
-        : null;
+    if (action === 'navigate' || action === 'click') {
+      const target = resolveTargetUrl(href, page.url());
 
       if (target) {
         console.log(`[navigate] → ${target}`);
@@ -54,19 +77,12 @@ router.post('/interact', async (req, res) => {
       } else {
         // Relative href or no href — fall back to element click
         console.log(`[click] "${selector}"`);
-        await page.click(selector, { timeout: 8000 });
+        await clickWithFallbacks(page, selector);
         await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
       }
       await page.waitForTimeout(600); // buffer for SPA hydration
     }
 
-    // ── Click (non-link: submit buttons, etc.) ───────────────────────────
-    else if (action === 'click') {
-      console.log(`[click] "${selector}" (href=${href || 'none'})`);
-      await page.click(selector, { timeout: 8000 });
-      await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
-      await page.waitForTimeout(600);
-    }
   } catch (err: any) {
     console.error(`[interact] ${action} on "${selector}" failed:`, err.message);
     // Fall through — return current page state so UI doesn't break

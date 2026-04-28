@@ -17,13 +17,96 @@ const INJECTION_SCRIPT = `
   window.__agReady = true;
 
   /* ---------- Selector builder ---------- */
+  function esc(v) {
+    return String(v || '').replace(/\\\\/g, '\\\\\\\\').replace(/"/g, '\\"');
+  }
+
+  function unique(sel) {
+    try { return document.querySelectorAll(sel).length === 1; } catch (_) { return false; }
+  }
+
+  function buildAttrSelector(tag, attr, value) {
+    if (!value) return '';
+    return tag + '[' + attr + '="' + esc(value) + '"]';
+  }
+
+  function stableAnchorSelector(el) {
+    if (!el || !el.getAttribute) return '';
+    var href = el.getAttribute('href') || '';
+    if (!href || href === '#' || href.indexOf('javascript:') === 0) return '';
+    var byHref = 'a[href="' + esc(href) + '"]';
+    if (unique(byHref)) return byHref;
+    var parent = el.parentElement;
+    if (parent) {
+      var psel = buildGeneralSelector(parent);
+      if (psel) {
+        var combined = psel + ' ' + byHref;
+        if (unique(combined)) return combined;
+      }
+    }
+    return byHref;
+  }
+
+  function stableAnchorTextSelector(el) {
+    if (!el || !el.innerText) return '';
+    var txt = el.innerText.trim().replace(/\\s+/g, ' ');
+    if (!txt) return '';
+    // Keep selector short and stable; Playwright supports :has-text().
+    var snippet = txt.substring(0, 60);
+    var escaped = esc(snippet);
+    var byText = 'a:has-text("' + escaped + '")';
+    if (unique(byText)) return byText;
+    var parent = el.parentElement;
+    if (parent) {
+      var psel = buildGeneralSelector(parent);
+      if (psel) return psel + ' ' + byText;
+    }
+    return byText;
+  }
+
   function getSelector(el) {
     var tag = el.tagName.toLowerCase();
-    if (el.id) return tag + '#' + el.id;
+    if (tag === 'a') {
+      var linkSel = stableAnchorSelector(el);
+      if (linkSel) return linkSel;
+      var textLinkSel = stableAnchorTextSelector(el);
+      if (textLinkSel) return textLinkSel;
+    }
+
+    var id = el.getAttribute && el.getAttribute('id');
+    if (id) {
+      var byId = buildAttrSelector(tag, 'id', id);
+      if (unique(byId)) return byId;
+    }
+
+    // Prefer stable semantic/test attributes before class chains.
+    var preferredAttrs = [
+      'name', 'data-testid', 'data-testid', 'data-test',
+      'data-qa', 'data-cy', 'aria-label', 'placeholder',
+      'title', 'key'
+    ];
+    for (var ai = 0; ai < preferredAttrs.length; ai++) {
+      var attr = preferredAttrs[ai];
+      var val = el.getAttribute && el.getAttribute(attr);
+      if (val) {
+        var sel = buildAttrSelector(tag, attr, val);
+        if (unique(sel)) return sel;
+      }
+    }
+
     var name = el.getAttribute && el.getAttribute('name');
-    if (name) return tag + '[name="' + name + '"]';
+    if (name) {
+      var byName = buildAttrSelector(tag, 'name', name);
+      if (unique(byName)) return byName;
+      return byName;
+    }
+
     var type = el.getAttribute && el.getAttribute('type');
-    if (type && tag === 'input') return tag + '[type="' + type + '"]';
+    if (type && tag === 'input') {
+      var byType = buildAttrSelector(tag, 'type', type);
+      if (unique(byType)) return byType;
+    }
+
     if (el.className && typeof el.className === 'string') {
       var parts = el.className.split(' ').filter(function(c) {
         return c.length > 0 && c !== 'ag-hover';
@@ -138,13 +221,17 @@ const INJECTION_SCRIPT = `
     var el = e.target;
     if (!el || !el.tagName) return;
 
-    var tag     = el.tagName.toLowerCase();
-    var sel     = getSelector(el);
-    var txt     = el.innerText ? el.innerText.trim().substring(0, 120) : '';
-    var val     = el.value || '';
-    var href    = resolveHref(el);
+    // Capture selector from the nearest actionable ancestor so clicks on nested
+    // spans/icons produce stable selectors for actual interactive elements.
+    var actionEl = el.closest('a,button,input,textarea,select,[role="button"],[onclick],[data-testid],[name]') || el;
+
+    var tag     = actionEl.tagName.toLowerCase();
+    var sel     = getSelector(actionEl);
+    var txt     = actionEl.innerText ? actionEl.innerText.trim().substring(0, 120) : '';
+    var val     = actionEl.value || '';
+    var href    = resolveHref(actionEl);
     var isInput = ['input', 'textarea', 'select'].indexOf(tag) !== -1;
-    var nav     = !isInput && isNavClick(el, href);
+    var nav     = !isInput && isNavClick(actionEl, href);
 
     if (nav) {
       /* Stop the page from navigating itself — backend handles it */
@@ -161,7 +248,7 @@ const INJECTION_SCRIPT = `
       href:    href,
       isNav:   nav,
       isInput: isInput,
-      loopHint: guessLoopHint(el)
+      loopHint: guessLoopHint(actionEl)
     }, '*');
   }, true);
 
