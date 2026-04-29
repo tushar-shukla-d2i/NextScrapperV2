@@ -38,16 +38,62 @@ async function extractValue(
   selector: string,
   attribute: string,
   contextHandle?: any,
-  textHint?: string
+  textHint?: string,
+  preferPageContext: boolean = false
 ): Promise<string> {
   try {
-    const ctx = contextHandle || page;
+    const ctx = preferPageContext ? page : (contextHandle || page);
     let el = null as any;
 
-    if (!contextHandle && textHint && textHint.trim()) {
-      const refined = page.locator(selector).filter({ hasText: textHint.trim() }).first();
-      if (await refined.count()) {
-        el = await refined.elementHandle();
+    const hint = (textHint || '').trim().toLowerCase();
+
+    // When selector is generic (e.g. many repeated `.value` blocks),
+    // pick the candidate whose surrounding text includes the label hint.
+    // Apply this primarily to text extraction to avoid breaking href/src clicks.
+    if (hint && selector && attribute !== 'href' && attribute !== 'src') {
+      try {
+        // Cheap first try: if the value element itself includes the hint, use it.
+        if (!contextHandle && hint) {
+          const refined = page.locator(selector).filter({ hasText: textHint!.trim() }).first();
+          if ((await refined.count()) > 0) el = await refined.elementHandle();
+        }
+
+        if (!el) {
+          const maxCandidates = 30;
+          const candidates = (() => {
+            try {
+              if (contextHandle && !preferPageContext && typeof (ctx as any).$$ === 'function') {
+                return (ctx as any).$$(selector);
+              }
+            } catch {
+              // ignore
+            }
+            return page.$$(selector);
+          })();
+
+          const arr = await candidates;
+          for (let i = 0; i < Math.min(arr.length, maxCandidates); i++) {
+            const candidate = arr[i];
+            if (!candidate) continue;
+            const candidateText = await candidate.evaluate((node: any) => {
+              let cur = node;
+              let t = '';
+              // Look up a few ancestor levels for the label text.
+              for (let depth = 0; depth < 3; depth++) {
+                if (!cur) break;
+                t += ' ' + (cur?.innerText || '');
+                cur = cur.parentElement;
+              }
+              return (t || node?.innerText || '').replace(/\s+/g, ' ').trim();
+            });
+            if (candidateText && candidateText.toLowerCase().includes(hint)) {
+              el = candidate;
+              break;
+            }
+          }
+        }
+      } catch {
+        // ignore and fall back to normal resolution
       }
     }
 
@@ -55,7 +101,53 @@ async function extractValue(
       el = await ctx.$(selector);
     }
 
-    if (!el) return '';
+    // If selector did not match in the item context (e.g. we already navigated),
+    // fall back to page context to keep later "extract" steps working.
+    if (!el) {
+      if (contextHandle) {
+        try {
+          el = await page.$(selector);
+        } catch {
+          el = null;
+        }
+      }
+      if (!el) return '';
+    }
+
+    // Some recorded selectors point at a button/span, while the actual link is a
+    // nested <a href="...">. When callers ask for href/src, resolve it from
+    // nested anchors/media first.
+    if (attribute === 'href') {
+      const direct = (await el.getAttribute('href').catch(() => '')) || '';
+      if (direct) return direct;
+      const nested = await el.$('a[href]').catch(() => null);
+      if (nested) {
+        const nestedHref = (await nested.getAttribute('href').catch(() => '')) || '';
+        if (nestedHref) return nestedHref;
+      }
+      const anyHref = await el.$('*[href]').catch(() => null);
+      if (anyHref) {
+        const anyHrefVal = (await anyHref.getAttribute('href').catch(() => '')) || '';
+        if (anyHrefVal) return anyHrefVal;
+      }
+      return '';
+    }
+
+    if (attribute === 'src') {
+      const direct = (await el.getAttribute('src').catch(() => '')) || '';
+      if (direct) return direct;
+      const nested = await el.$('img[src]').catch(() => null);
+      if (nested) {
+        const nestedSrc = (await nested.getAttribute('src').catch(() => '')) || '';
+        if (nestedSrc) return nestedSrc;
+      }
+      const anySrc = await el.$('*[src]').catch(() => null);
+      if (anySrc) {
+        const anySrcVal = (await anySrc.getAttribute('src').catch(() => '')) || '';
+        if (anySrcVal) return anySrcVal;
+      }
+      return '';
+    }
 
     switch (attribute) {
       case 'textContent':
@@ -65,9 +157,11 @@ async function extractValue(
       case 'value':
         return await el.inputValue().catch(() => '') || '';
       case 'href':
-        return await el.getAttribute('href') || '';
+        // handled above
+        return '';
       case 'src':
-        return await el.getAttribute('src') || '';
+        // handled above
+        return '';
       default:
         return await el.getAttribute(attribute) || '';
     }
@@ -86,8 +180,20 @@ function normalizeSelectorForItemContext(selector: string): string {
     .replace(/:has-text\(\s*'[^']*'\s*\)/gi, '')
     .replace(/:text\(\s*"[^"]*"\s*\)/gi, '')
     .replace(/:text\(\s*'[^']*'\s*\)/gi, '')
+    // Also strip fixed href/src attribute values that can lock iteration to one donor link.
+    .replace(/\[\s*href\s*=\s*"[^"]*"\s*\]/gi, '[href]')
+    .replace(/\[\s*href\s*=\s*'[^']*'\s*\]/gi, '[href]')
+    .replace(/\[\s*src\s*=\s*"[^"]*"\s*\]/gi, '[src]')
+    .replace(/\[\s*src\s*=\s*'[^']*'\s*\]/gi, '[src]')
     .replace(/\s{2,}/g, ' ')
     .trim();
+}
+
+function selectorCacheKey(selector: string): string {
+  // Safe, stable object key fragment for caching extracted href/src per sub-step.
+  // Keep it reasonably short to avoid huge keys for complex selectors.
+  const s = (selector || '').trim().replace(/\s+/g, ' ');
+  return s.replace(/[^\w-]/g, '_').slice(0, 120);
 }
 
 // ── Apply extraction template to a page/element context ──────────────────────
@@ -99,7 +205,16 @@ async function applyTemplate(
   const record: Record<string, string> = {};
   for (const field of template) {
     if (!field.label || !field.selector) continue;
-    record[field.label] = await extractValue(page, field.selector, field.attribute, contextHandle);
+    // Use the field label as a hint to disambiguate selectors that match
+    // multiple "value" blocks (common in card UIs).
+    record[field.label] = await extractValue(
+      page,
+      field.selector,
+      field.attribute,
+      contextHandle,
+      field.label,
+      false
+    );
   }
   return record;
 }
@@ -313,10 +428,12 @@ async function executeStep(
   options?: {
     contextHandle?: any;
     currentRecord?: Record<string, string>;
+    preferPageContext?: boolean;
   }
 ): Promise<void> {
   const contextHandle = options?.contextHandle;
   const currentRecord = options?.currentRecord;
+  const preferPageContext = options?.preferPageContext ?? false;
   const effectiveSelector = step.selector && contextHandle
     ? normalizeSelectorForItemContext(step.selector)
     : step.selector;
@@ -335,9 +452,38 @@ async function executeStep(
       if (effectiveSelector) {
         emitLog(`Clicking "${effectiveSelector}"…`);
         try {
-          const navTarget = resolveNavigationTarget(step.value, page.url());
+          let navTarget: string | null = null;
+
+          // In iterate context, prefer href/src from the current item over recorded value.
+          if (contextHandle) {
+            const dynamicHref = await extractValue(page, effectiveSelector, 'href', contextHandle, step.text, preferPageContext);
+            navTarget = resolveNavigationTarget(dynamicHref, page.url());
+            if (!navTarget) {
+              const dynamicSrc = await extractValue(page, effectiveSelector, 'src', contextHandle, step.text, preferPageContext);
+              navTarget = resolveNavigationTarget(dynamicSrc, page.url());
+            }
+
+            // If the element handle is detached (common after navigation),
+            // fall back to the precomputed per-item nav target.
+            if (!navTarget && currentRecord) {
+              const key = `__navTarget__${selectorCacheKey(effectiveSelector || step.selector || '')}`;
+              if (currentRecord[key]) {
+                navTarget = resolveNavigationTarget(currentRecord[key], page.url());
+              }
+            }
+          }
+
+          // Fallback to recorded navigation target when dynamic resolution is unavailable.
+          if (!navTarget && !contextHandle) {
+            // Outside iterate context, using the recorded href is acceptable.
+            // Inside iterate context, we must not reuse a single recorded href
+            // for all items; if dynamic resolution fails, we should click the
+            // element within the current card context instead.
+            navTarget = resolveNavigationTarget(step.value, page.url());
+          }
+
           if (navTarget) {
-            emitLog(`  Navigating via recorded href: ${navTarget}`);
+            emitLog(`  Navigating via item link: ${navTarget}`);
             await page.goto(navTarget, { waitUntil: 'domcontentloaded', timeout: 20000 });
             await page.waitForTimeout(500);
             break;
@@ -375,7 +521,7 @@ async function executeStep(
     case 'extract':
       if (effectiveSelector && currentRecord) {
         const key = (step.label || effectiveSelector).trim();
-        if (!contextHandle) {
+        if (!contextHandle || preferPageContext) {
           await page.locator(effectiveSelector).first().waitFor({ state: 'attached', timeout: 3000 }).catch(() => {});
         }
         let value = await extractValue(
@@ -383,7 +529,10 @@ async function executeStep(
           effectiveSelector,
           step.attribute || 'textContent',
           contextHandle,
-          step.text
+          // Use label (e.g. "BMI") as hint so generic value selectors
+          // select the correct block.
+          step.text || step.label,
+          preferPageContext
         );
         const normalizedLabel = (step.label || '').trim().toLowerCase();
         if (normalizedLabel === 'id') {
@@ -397,6 +546,25 @@ async function executeStep(
           emitLog(`  Selector result looked wrong for "${key}" ("${value}") — trying fallback`);
           value = '';
         }
+
+        // Extra robustness for donor "id": even if the selector is slightly off,
+        // try to infer an ED-code from the current context (card before click,
+        // profile page after click).
+        if (!value && normalizedLabel === 'id') {
+          try {
+            const sourceText = preferPageContext
+              ? (await page.locator('body').innerText()).replace(/\s+/g, ' ').trim()
+              : ((await contextHandle?.textContent?.()) || '').replace(/\s+/g, ' ').trim();
+            const inferred = donorTokenFromText(sourceText);
+            if (inferred) {
+              value = inferred;
+              emitLog(`  Inferred "${key}" = "${inferred}" from page/card text`);
+            }
+          } catch {
+            // ignore
+          }
+        }
+
         if (!value && !contextHandle && step.label) {
           const inferred = await inferValueByLabel(page, step.label);
           if (inferred) {
@@ -521,6 +689,7 @@ export const runScraper = async (
         emitLog(`Iterating over "${itemSel}" inside "${containerSel}"…`);
 
         let itemHandles: any[];
+        const listingUrlAtStart = page.url();
         if (containerSel === 'body' || !containerSel) {
           itemHandles = await page.$$(itemSel);
         } else {
@@ -539,17 +708,80 @@ export const runScraper = async (
           (!step.iterateSteps || step.iterateSteps.length === 0) &&
           extractionTemplate.length === 0;
 
-        for (let i = 0; i < itemHandles.length; i++) {
+        // Precompute href/src navigation targets for click sub-steps
+        // for ALL items before we execute any inner steps.
+        // This avoids relying on element handles after the page navigates away.
+        const precomputedNavTargetsByIndex: Record<number, Record<string, string>> = {};
+        if (step.iterateSteps && step.iterateSteps.length > 0) {
+          for (let i = 0; i < itemHandles.length; i++) {
+            const handle = itemHandles[i];
+            const navCache: Record<string, string> = {};
+
+            for (const subStep of step.iterateSteps) {
+              if (subStep.action !== 'click') continue;
+              if (!subStep.selector) continue;
+
+              const effectiveSubSelector = normalizeSelectorForItemContext(subStep.selector);
+              const href = await extractValue(page, effectiveSubSelector, 'href', handle, subStep.text);
+              const src = !href
+                ? await extractValue(page, effectiveSubSelector, 'src', handle, subStep.text)
+                : '';
+              const navCandidate = href || src || '';
+              if (navCandidate) {
+                navCache[`__navTarget__${selectorCacheKey(effectiveSubSelector)}`] = navCandidate;
+              }
+            }
+
+            precomputedNavTargetsByIndex[i] = navCache;
+          }
+        }
+
+        const totalItems = itemHandles.length;
+        for (let i = 0; i < totalItems; i++) {
+          // Ensure we are back on the listing page before running any
+          // card-level extraction steps for this item.
+          if (page.url() !== listingUrlAtStart) {
+            emitLog(`  Returning to listing for item ${i + 1}…`);
+            await page.goto(listingUrlAtStart, { waitUntil: 'domcontentloaded', timeout: 30000 });
+            await page.waitForLoadState('networkidle', { timeout: 8000 }).catch(() => {});
+            await page.waitForTimeout(300);
+
+            // Re-query item handles so we don't depend on detached nodes.
+            if (containerSel === 'body' || !containerSel) {
+              itemHandles = await page.$$(itemSel);
+            } else {
+              const containerEl = await page.$(containerSel);
+              itemHandles = containerEl ? await containerEl.$$(itemSel) : await page.$$(itemSel);
+            }
+          }
+
           const handle = itemHandles[i];
-          const itemRecord: Record<string, string> = { _index: String(i + 1) };
+          if (!handle) {
+            emitLog(`  ⚠️  Item ${i + 1}: missing element after reload — skipping`);
+            continue;
+          }
+
+          const itemRecord: Record<string, string> = {
+            _index: String(i + 1),
+            ...(precomputedNavTargetsByIndex[i] || {})
+          };
 
           // Execute any inner steps on the item
           if (step.iterateSteps && step.iterateSteps.length > 0) {
+            let preferPageContext = false;
             for (const subStep of step.iterateSteps) {
+              const urlBefore = page.url();
               await executeStep(page, subStep, emitLog, {
                 contextHandle: handle,
-                currentRecord: itemRecord
+                currentRecord: itemRecord,
+                preferPageContext
               });
+
+              // Once we navigate (e.g. click into donor profile), subsequent
+              // extracts should be page-based, not listing-card-based.
+              if (!preferPageContext && page.url() !== urlBefore) {
+                preferPageContext = true;
+              }
             }
           }
 
